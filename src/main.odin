@@ -10,16 +10,18 @@ app: App
 usage :: proc() {
 	fmt.println("vibehw64 — Linux hardware sensor monitor")
 	fmt.println("")
-	fmt.println("usage: vibehw64 [--probe] [--ticks N] [--interval MS] [--sys-root DIR]")
+	fmt.println("usage: vibehw64 [--probe] [--snapshot] [--ticks N] [--interval MS] [--sys-root DIR]")
 	fmt.println("")
 	fmt.println("  --probe          discover sensors, sample N times, print, exit")
-	fmt.println("  --ticks N        samples to take in probe mode (default 3)")
-	fmt.println("  --interval MS    sample interval in milliseconds (default 500)")
+	fmt.println("  --snapshot       print the copy-to-clipboard text and exit")
+	fmt.println("  --ticks N        samples to take in probe/snapshot mode (default 3)")
+	fmt.println("  --interval MS    sample interval in milliseconds (default 1500)")
 	fmt.println("  --sys-root DIR   sysfs root; test hook, defaults to /sys")
 }
 
 main :: proc() {
 	probe := false
+	snapshot := false
 	ticks := 3
 	interval := 1500
 	sys_root := "/sys"
@@ -31,6 +33,9 @@ main :: proc() {
 		switch a {
 		case "--probe":
 			probe = true
+			i += 1
+		case "--snapshot":
+			snapshot = true
 			i += 1
 		case "--ticks":
 			if i + 1 < len(args) {
@@ -83,6 +88,11 @@ main :: proc() {
 		os.exit(1)
 	}
 
+	if snapshot {
+		snapshot_run(ticks, interval)
+		return
+	}
+
 	if !probe {
 		if !run_ui() {
 			os.exit(1)
@@ -91,6 +101,25 @@ main :: proc() {
 	}
 
 	probe_run(ticks)
+}
+
+snapshot_run :: proc(ticks: int, interval: int) {
+	dt := f64(interval) / 1000.0
+	for t in 0 ..< ticks {
+		if t > 0 {
+			time.sleep(time.Duration(interval) * time.Millisecond)
+		}
+		sample_all(&app, dt)
+		usage_update(&app, dt)
+		net_update(&app, dt)
+		meminfo_update(&app, dt)
+	}
+	for i in 0 ..< app.metric_count {
+		ui_metrics[i] = app.metrics[i]
+	}
+	ui_n = app.metric_count
+	n := ui_copy_build()
+	fmt.print(string(ui_copy_buf[:n]))
 }
 
 probe_run :: proc(ticks: int) {
@@ -152,17 +181,28 @@ probe_run :: proc(ticks: int) {
 		sample_all(&app, dt)
 		usage_update(&app, dt)
 		net_update(&app, dt)
+		meminfo_update(&app, dt)
 		fmt.printfln("")
 		fmt.printfln("--- sample %d/%d ---", t + 1, ticks)
 		print_snapshot()
 	}
 }
 
+print_group_rows :: proc(gi: int) -> int {
+	n := 0
+	for m in 0 ..< app.metric_count {
+		if int(app.metrics[m].group) == gi {
+			n += 1
+		}
+	}
+	return n
+}
+
 print_snapshot :: proc() {
 	for si in 0 ..< app.section_count {
 		gcount := 0
 		for g in 0 ..< app.group_count {
-			if int(app.groups[g].section) == si {
+			if int(app.groups[g].section) == si && print_group_rows(g) > 0 {
 				gcount += 1
 			}
 		}
@@ -181,6 +221,9 @@ print_snapshot :: proc() {
 		fmt.printfln("[%s]", app.sections[si].label)
 		for g in 0 ..< app.group_count {
 			if int(app.groups[g].section) != si {
+				continue
+			}
+			if print_group_rows(g) == 0 {
 				continue
 			}
 			if gcount > 1 {

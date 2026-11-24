@@ -1,9 +1,9 @@
 # SPEC.md — vibehw64
 
-Specification of the **v1.0 build**: what it is, what it may and may not do, and the rules the
+Specification of the **v1.1 build**: what it is, what it may and may not do, and the rules the
 implementation follows. This document describes the shipped code, not a plan.
 
-Version: `1.0.0` · Target: Linux x86-64 desktops
+Version: `1.1.0` · 2026-11-24 · Target: Linux x86-64 desktops
 
 ---
 
@@ -13,7 +13,9 @@ A HWiNFO64-style **sensors window** for Linux, distributed as a single executabl
 from any directory with no installation, no configuration file and no background service.
 
 It presents a collapsible tree of hardware readings with **Current / Minimum / Maximum /
-Average** and a reset control, covering CPU, DDR5 memory, AMD GPU, storage and network.
+Average** and a reset control, covering CPU, DDR5/DDR4 memory, AMD GPU, storage, network and
+the remaining board/peripheral `hwmon` sensors. It can also copy the current snapshot as
+aligned text.
 
 ## 2. Hard constraints
 
@@ -22,10 +24,10 @@ Average** and a reset control, covering CPU, DDR5 memory, AMD GPU, storage and n
 | Language | **Pure Odin** |
 | UI dependency | **`vendor:raylib` only** — no GTK, Qt, CMake, SDL, or hand-written C bindings |
 | Distribution | **One executable**, `bin/vibehw64` |
-| Assets | Font is **embedded at compile time** via `#load`; no runtime asset files |
+| Assets | Font **and icon** are embedded at compile time via `#load`; no runtime asset files |
 | Config | **No config file** and no saved state; every launch starts fresh |
 | Privilege | The app itself **never runs as root** and never requires `sudo` |
-| Idle cost | Under 1% of one core at the default interval |
+| Idle cost | Under 1% of one core at the default interval (design target) |
 | Steady-state allocation | **Zero** heap allocation in the polling or drawing loop |
 
 The binary still links the system graphics stack dynamically (`libGL`, `libX11`,
@@ -48,6 +50,9 @@ assets, no config** — not "no shared libraries".
   -lXcursor -lXi -lXfixes -lwayland-client -lwayland-cursor -lwayland-egl -lxkbcommon"`.
 - **Font**: DejaVu Sans Mono, vendored in `src/assets/` with its licence, embedded with
   `#load("assets/DejaVuSansMono.ttf")`.
+- **Icon**: PNGs (16–256 px) plus the SVG source in `src/assets/`, embedded at compile time
+  and passed to the window manager with `SetWindowIcons`. Native Wayland ignores runtime
+  window icons; X11/XWayland shows them.
 
 No other third-party libraries. `core:` and `vendor:` packages only.
 
@@ -60,44 +65,58 @@ vibehw64/
 ├── ARCHITECTURE.md      implementation deep-dive for future maintainers
 ├── RELEASE.md           release notes for the binary
 ├── build.sh             release build -> bin/vibehw64
-├── .gitignore           bin/, ARCHIVE/, temp/, *.o
-├── bin/                 build output (gitignored)
+├── bin/                 build output
 ├── docs/screenshot.jpg
 ├── src/
-│   ├── main.odin        entry point, argument parsing, probe output
+│   ├── main.odin        entry point, argument parsing, probe/snapshot output
 │   ├── topology.odin    CPU topology: packages, groups, cores
 │   ├── sensors_linux.odin  sensor model, discovery, registry, display helpers
-│   ├── storage.odin     per-drive sections and memory identity rows
+│   ├── storage.odin     per-drive sections and memory identity/usage rows
+│   ├── meminfo.odin     /proc/meminfo-backed memory usage metrics
 │   ├── net.odin         per-NIC sections, Wi-Fi SSID/signal
 │   ├── usage.odin       CPU utilisation from /proc/stat
-│   ├── names.odin       CPU short names, pci.ids lookup, SMBIOS, SPD decode
+│   ├── names.odin       CPU short names, pci.ids (incl. subsystem), SMBIOS, SPD decode
 │   ├── perms.odin       in-app privilege setup (pkexec)
 │   ├── sampler.odin     background sampling thread, snapshot, stats
-│   ├── ui.odin          raylib window, tree, columns, scrollbar, banner
-│   └── assets/          embedded font + licence
+│   ├── ui.odin          raylib window, tree, columns, scrollbar, banner, Copy, bands
+│   └── assets/          embedded font, icon PNG/SVG, licences
+├── tests/
+│   └── run-fixtures.py  synthesized AMD/Intel/SMBIOS regression trees
 └── scripts/
-    ├── build-raylib-static.sh   one-time static raylib build
+    ├── build-raylib-static.sh   one-time static raylib build (uses temp/)
     └── install-permissions.sh   manual equivalent of the in-app setup
 ```
 
-`ARCHIVE/` is development scratch and is excluded from the repository.
+`bin/` and `temp/` are build output/scratch, not source. `tests/run-fixtures.py` creates its
+fixtures in a temporary directory and removes them after the run.
 
 ## 5. Data model
 
 Fixed-capacity, statically allocated. No dynamic containers anywhere.
 
 ```text
-MAX_SECTIONS 24   MAX_GROUPS 16    MAX_SENSORS 512    MAX_SOURCES 512
-MAX_CPUS     256  MAX_LABEL  40
+MAX_SECTIONS 64   MAX_GROUPS 128   MAX_SENSORS 512   MAX_SOURCES 512
+MAX_CPUS     256  MAX_CLASSES 8    MAX_LABEL   48    MAX_DIMMS   16
+MAX_NET      8
 ```
 
-- **Section** — a top-level collapsible row. Seven fixed sections are created first, in
-  `Section_Id` order; drives and NICs append further sections dynamically.
-- **Group** — a collapsible sub-area within a section (`P-Cores`, `E-Cores`, `CCD 0`, …).
-  A section with exactly one group renders its rows directly with no redundant sub-header.
+- **Section** — a top-level collapsible row. **Four fixed sections** are created first, in
+  `Section_Id` order: CPU, Memory, GPU, Voltages. Drives, NICs and the final
+  **Other Sensors** section append dynamically. Other is deliberately last.
+- **Group** — a collapsible subsection within a section. The structure is one group level:
+  - CPU: `Package & Power`, `Thermal Headroom - Package`, `CPU Core Clocks - <class>`,
+    `CPU Core Usage - <class>`, `CPU Core Temperatures - <class>`,
+    `<class> - Distance from TjMax (<limit> C)`, `<class> - Distance from Tcontrol (<limit> C)`.
+  - Memory: `Usage`, `Modules`, `Temperatures`.
+  - GPU: `GPU`; Voltages: `Voltages`; Other: `Temperatures`, `Fans`.
+  - Drives: `Drive`; NICs: `Link`.
+  - A section with exactly one non-empty group renders its rows directly; empty groups are
+    skipped.
 - **Sensor_Source** — one pre-opened file descriptor plus parse kind, scale, and RAPL
   baseline. `NO_SOURCE` marks computed metrics that have no file descriptor.
-- **Sensor_Metric** — label, unit, class, group, source index, and the statistics.
+- **Sensor_Metric** — label, unit, class, group, source index, and statistics. Derived rows
+  also carry `derived_from` (the source metric) and `limit` (the TjMax/Tcontrol value).
+- Long labels are capped at **48** bytes. CPU/GPU/memory identity strings live in `App`.
 
 **Statistics rule:** average is **time-weighted** (`Σ value·dt / Σ dt`), not a plain mean.
 The interval is user-editable, so a plain mean would be silently skewed by a rate change.
@@ -126,28 +145,41 @@ any specific SKU.
    multiset of discovered `core_id`s); on mismatch, raw labels are shown untagged rather than
    guessed.
 
+All CPU sensor groups live under the single CPU section; the old top-level clocks/usage/
+temperatures/thermal sections were folded into it.
+
 ## 7. Sensor sources
 
 | Family | Source | Notes |
 | --- | --- | --- |
 | Core clocks | `cpuN/cpufreq/scaling_cur_freq` (kHz) | `cpuinfo_max_freq` read once for grouping |
 | Package/core temps | `hwmon` `name == coretemp` | package found by `Package id N` label, not index |
+| TjMax/Tcontrol | `coretemp` `tempN_crit` / `tempN_max` | package + per-core; distances derived from the live temp |
 | Power | `powercap` `intel-rapl` (preferred) | `intel-rapl-mmio` only if the MSR tree is absent — both mirror the same counters |
+| PL1/PL2 + windows | `powercap` `constraint_N_name/power_limit_uw/time_window_us` | matched by `long_term`/`short_term`, not index |
+| Memory usage | `/proc/meminfo` | `MemTotal/MemAvailable`, commit, swap; read once per sample |
+| Memory identity | SMBIOS type 17 | configured speed preferred, size/locator for per-DIMM, configured voltage |
 | DIMM temps | `hwmon` `spd5118` / `jc42` | labelled from the i2c address, e.g. `DIMM #0 (0x51)` |
-| GPU | `hwmon` `amdgpu` + `drm/cardN/device/gpu_busy_percent` | `card0` is not assumed |
+| GPU | `hwmon` `amdgpu` + `drm/cardN/device/*` | `card0` is not assumed; VRAM used/total from the DRM node |
 | CPU usage | `/proc/stat` | deltas; per core and aggregate |
 | Drives | `/sys/class/nvme`, `/sys/class/block`, `hwmon nvme`, `statfs` | NVMe temps matched by hwmon device basename |
 | NICs | `/proc/net/dev`, `/sys/class/net/*/speed` | non-physical interfaces skipped |
 | Wi-Fi | `SIOCGIWESSID` ioctl, `/proc/net/wireless` | wext emulation via `CONFIG_CFG80211_WEXT` |
-| Memory identity | SMBIOS type 17 | configured speed (`0x20`) preferred, else rated (`0x15`); configured voltage `0x26` |
+| Other sensors | unclaimed `hwmon` `temp*_input` / `fan*_input` | ACPI zones, NIC/Wi-Fi/board temps and fans |
 | Names | `/proc/cpuinfo`, `pci.ids`, SMBIOS, SPD | see §8 |
 
 **RAPL:** `Watts = Δenergy_uj / (Δt · 10⁶)`, with `max_energy_range_uj` added on wrap. First
 sample yields no value — the row shows `--` until a second reading exists.
 
+**PL1/PL2 and TAU:** limits are read once and published as static rows; time windows are
+auto-scaled to seconds or milliseconds. They are BIOS/EC policy, not measured power.
+
+**Derived rows:** TjMax/Tcontrol distance metrics are computed from an already-sampled
+temperature metric (`derived_from`) and a static `limit`; no extra file descriptor per core.
+
 **Reading discipline:** descriptors are opened once at discovery. Polling is
 `seek(fd, 0)` + `read` into fixed stack buffers. No directory walk and no allocation in the
-loop.
+loop. `/proc/meminfo` is one fd read per tick, like `/proc/stat`.
 
 ## 8. Naming
 
@@ -155,42 +187,47 @@ loop.
   is stripped (`Intel(R) `, `Core(TM) `, `(R)`, `(TM)`, `AMD `, ` CPU`, ` Processor`) plus any
   token ending in `-Core`. If stripping leaves nothing, the full brand string is used.
   No per-SKU table, no regex.
-- **GPU** — `/usr/share/hwdata/pci.ids` keyed by PCI vendor:device; the bracketed marketing
-  name is preferred. Streamed in 64 KB chunks. Absent file means no suffix.
-- **Memory** — SMBIOS configured speed and part number; `XMP/EXPO` appended to the section
-  title when configured speed exceeds the SPD JEDEC bin.
-- Section titles read `CPU Core Clocks - Ultra 7 270K Plus`,
-  `Memory (DDR5 SPD) - 6000MT  F5-6000J3636F16G  XMP/EXPO`.
+- **GPU** — `/usr/share/hwdata/pci.ids` keyed by PCI vendor:device; the subsystem
+  vendor:device is preferred when present, so an AIB entry such as
+  `Nitro+ Radeon RX 570/580/590` replaces the generic family list. Falls back to
+  vendor:device, then to no suffix.
+- **Memory** — SMBIOS configured speed and part number; `XMP/EXPO` appended when configured
+  speed exceeds the SPD JEDEC bin. The section is `Memory`, or `Memory (DDR5 SPD)` only when
+  an SPD5 EEPROM was actually decoded.
+- **SMBIOS nominal voltage** — the type 17 configured-voltage field is firmware nominal data,
+  not a live VDIMM measurement. The row is labelled `SMBIOS Nominal Voltage`.
+- Section titles read `CPU - Ultra 7 270K Plus`,
+  `Memory - 6000MT  F5-6000J3636F16G  XMP/EXPO`,
+  `GPU (AMD) - Nitro+ Radeon RX 570/580/590`.
 
 ## 9. UI
 
 - Dark theme, resizable, default `760 × 820`, minimum `640 × 480`.
 - **10 FPS** (`SetTargetFPS(10)`). When minimised the frame clock is kept alive but no
   formatting or drawing occurs.
-- **Toolbar:** `Reset Min/Max` button and an `Interval [1500] ms` field. No summary readout —
-  every value already appears in the tree.
+- **Toolbar:** `Reset Min/Max`, an `Interval [1500] ms` field, and a right-aligned **Copy**
+  button. No summary readout — every value already appears in the tree.
+- **Copy:** builds an aligned plain-text snapshot from the UI snapshot (all sections, groups
+  and rows regardless of collapse state), places it on the clipboard via
+  `SetClipboardText`, and flashes `Copied`. The same formatter backs `--snapshot`.
 - **Columns:** `Sensor | Current | Minimum | Maximum | Average | Unit`. Drag a divider to
   resize (7 px grab zone, resize cursor, highlighted line); **double-click a divider to
   auto-fit** the column to its widest rendered row (minimum 44 px). Widths persist for the
   session; growing the window widens the Sensor column by the delta.
 - **Scrollbar:** dedicated 13 px strip on the right, outside the table. Proportional thumb,
   draggable, track click jumps. Table and hit-testing stop at the strip's left edge.
-- **Colour thresholds** are per sensor class, gated on Celsius so clocks do not trip them:
-
-  | Class | Amber | Red |
-  | --- | --- | --- |
-  | CPU package / core | ≥ 85 | ≥ 95 |
-  | DIMM | ≥ 65 | ≥ 75 |
-  | GPU edge | ≥ 80 | ≥ 90 |
-  | GPU junction | ≥ 95 | ≥ 105 |
-  | GPU memory | ≥ 85 | ≥ 95 |
-  | Drive | ≥ 70 | ≥ 80 |
-
+- **Temperature bands:** measured Celsius cells are evaluated independently. Below 60 C the
+  normal row colours apply. 60.0–69.9 C is a green box with white text; 70.0–79.9 C orange;
+  80.0 C+ red. Distance rows, `TjMax`/`Tcontrol` limit rows and non-Celsius values are
+  excluded.
+- **Distance colours:** the TjMax distance text uses the equivalent 85/95 C thresholds; the
+  Tcontrol distance goes amber within 5 C of Tcontrol and red at/above it. The static limit
+  rows are uncoloured.
 - **Input:** interval field accepts digits only, Enter commits, Esc reverts, clamped
   `100..10000`. `R` resets only when the field is unfocused.
-- **Numbers** are right-aligned with per-unit precision (`MHz` 0, `°C` 1, `W` 2, `RPM` 0,
-  `%` 0, `mV` 0, `V` 3, `MT/s` 0, `GB` 0, `TB` 1, `dBm` 0). Unseen or stale shows `--`.
-  Odin's `fmt` zero-pads numeric widths, so padding is done manually.
+- **Numbers** are right-aligned with per-unit precision (`MHz` 0, `C` 1, `W` 2, `RPM` 0,
+  `%` 0, `mV` 0, `V` 3, `MT/s` 0, drive `GB` 0, `TB` 1, RAM `GB` 2, seconds/ms 2, `dBm` 0).
+  Unseen or stale shows `--`. Odin's `fmt` zero-pads numeric widths, so padding is manual.
 
 ## 10. Permissions
 
@@ -226,35 +263,44 @@ pkexec /bin/sh -c "<fixed script>"
 `scripts/install-permissions.sh` performs the identical operation for headless or scripted
 use, and supports `--uninstall`. It also removes rule/unit files from before the app rename.
 
-## 11. Build
+## 11. Build and tests
 
 ```sh
-sudo scripts/build-raylib-static.sh   # once: builds + installs libraylib.a
+sudo scripts/build-raylib-static.sh   # once: builds + installs libraylib.a; clones into temp/
 ./build.sh                            # -> bin/vibehw64
+python3 tests/run-fixtures.py         # AMD CCD/[3D], Intel fallback, synthetic SMBIOS
 ```
 
 `build.sh` links statically against raylib and produces a binary with **no `libraylib`
-dependency**.
+dependency**. The fixture script synthesizes sysfs trees and a small DMI table, runs
+`--probe --sys-root` against them, and exits non-zero on a missing expected group/row.
 
-## 12. Non-goals for v1.0
+## 12. Non-goals for v1.1
 
-NVIDIA GPUs · SMART attributes and `smartctl` · fan speeds · motherboard/ambient sensors ·
-XMP/EXPO timing decode · CPU core voltage (needs MSR or a bound Super I/O driver) · per-thread
-rows · multi-socket UI · saved window/section state · graphs, history, logging, alerts ·
-non-Linux platforms.
+NVIDIA GPUs · SMART attributes and `smartctl` · **fan control** (monitoring is implemented
+where `hwmon` exposes it) · board sensors not exposed by a bound `hwmon` driver · XMP/EXPO timing decode · CPU core voltage (needs MSR or a bound Super I/O driver) ·
+per-thread rows · multi-socket UI · saved window/section state · graphs, history, logging,
+alerts · non-Linux platforms.
 
 ## 13. Verification matrix
 
 | Area | Verified how |
 | --- | --- |
-| CPU topology (Intel hybrid) | live on Core Ultra 7 270K Plus, 8P + 16E |
-| CPU topology (AMD CCD, `[3D]`) | synthetic sysfs fixture via `--sys-root` |
-| CPU topology (frequency fallback) | synthetic 12600K-shaped fixture |
-| `coretemp` ↔ core mapping | live, all 24 cores attributed |
-| Power | live, 40.3 W package / 26.5 W IA under load |
-| Memory speed/voltage | live, matches `dmidecode` (6000 MT/s, 1350 mV) |
-| Drives | live, NVMe 3 sensors + capacity/usage; 16 TB HDD capacity |
+| CPU topology (Intel non-hybrid) | live, i9-10850K, 10C/20T, one `All Cores` group |
+| CPU topology (AMD CCD, `[3D]`) | `tests/run-fixtures.py` (16C/32T, two CCDs, 96 MB vs 32 MB L3) |
+| CPU topology (Intel frequency fallback) | `tests/run-fixtures.py` (6 P + 4 E, no PMU masks) |
+| SMBIOS walker / per-DIMM | synthetic DMI blob in `tests/run-fixtures.py` (2 × 16 GB, 6000 MT/s) |
+| `coretemp` ↔ core mapping | live, all 10 physical cores attributed |
+| PL1/PL2 + TAU | live, 75 W / 115 W, 47.97 s / 2.44 ms |
+| TjMax/Tcontrol distances | live, package and all cores sum correctly to 100.0 / 84.0 C |
+| Memory usage | live, installed 64.00 / usable 62.66 GB, sums reconcile |
+| Per-DIMM capacity/speed | live, 2 × 32.00 GB, 4000 MT/s |
+| VRAM used/total | live, matches DRM sysfs bytes |
+| Copy / `--snapshot` | output generated and inspected; same formatter as the button |
+| Temperature band thresholds | boundary check 59.9/60/69.9/70/79.9/80/100 C |
+| Drives | live, NVMe + 16 TB HDD capacity/usage |
 | NICs | live, 1000 Mb/s link + utilisation |
-| Wi-Fi SSID | **not verified while associated** — radio was down during development |
-| Self-heal (pkexec) | verified end-to-end by the maintainer on the reference host |
-| Steady-state CPU | 0.5% of one core at 10 Hz sampling, 4.6 MB RSS |
+| Wi-Fi SSID | **not verified while associated** — radio was down/absent during development |
+| Wi-Fi temperature | may show `--` until the driver reports a value |
+| Self-heal (pkexec) | verified previously on the reference host; not re-run here |
+| Steady-state cost | v1.0 measured 0.5% of one core / 4.6 MB; **not re-profiled for v1.1** |

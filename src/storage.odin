@@ -351,20 +351,13 @@ path_access :: proc(path: string) -> (exists: bool, denied: bool) {
 	return true, true
 }
 
-discover_memory_info :: proc(app: ^App, group: u8) {
-	path_buf: [512]u8
+memory_apply_identity :: proc(app: ^App, info: SMB_Memory) {
+	app.dmi_ok = true
+	app.ram_speed_mt = info.speed_mt
+	app.ram_voltage_mv = info.volt_mv
 	scratch: [96]u8
 
-	app.dmi_ok = false
-	app.memory_speed_metric = u16(metric_add_computed(app, "Memory Speed", .MTs, .DIMM, group))
-	app.memory_voltage_metric = u16(metric_add_computed(app, "Memory Voltage", .Volts, .DIMM, group))
-
-	dp := fmt_path(&path_buf, "%s/firmware/dmi/tables/DMI", app.sys_root)
-	info := smbios_memory(dp)
-	if info.ok {
-		app.dmi_ok = true
-		app.ram_speed_mt = info.speed_mt
-		app.ram_voltage_mv = info.volt_mv
+	if info.speed_mt > 0 {
 		if len(info.part) > 0 && !info.mixed {
 			label := fmt.bprintf(scratch[:], "%dMT  %s", info.speed_mt, info.part)
 			app.ram_short_len = label_set(app.ram_short[:], label)
@@ -372,11 +365,54 @@ discover_memory_info :: proc(app: ^App, group: u8) {
 			label := fmt.bprintf(scratch[:], "%dMT", info.speed_mt)
 			app.ram_short_len = label_set(app.ram_short[:], label)
 		}
-		if app.memory_speed_metric != NO_METRIC {
-			metric_set_static(app, int(app.memory_speed_metric), f64(info.speed_mt))
+	} else if len(info.part) > 0 && !info.mixed {
+		app.ram_short_len = label_set(app.ram_short[:], info.part)
+	}
+
+	if info.speed_mt > 0 && app.memory_speed_metric != NO_METRIC {
+		metric_set_static(app, int(app.memory_speed_metric), f64(info.speed_mt))
+	}
+	if info.volt_mv > 0 && app.memory_voltage_metric != NO_METRIC {
+		metric_set_static(app, int(app.memory_voltage_metric), f64(info.volt_mv) / 1000.0)
+	}
+}
+
+discover_memory_info :: proc(app: ^App, usage_group: u8, modules_group: u8) {
+	path_buf: [512]u8
+	label_buf: [MAX_LABEL]u8
+	loc_buf: [MAX_LABEL]u8
+
+	app.dmi_ok = false
+	app.memory_speed_metric = u16(metric_add_computed(app, "Memory Speed", .MTs, .DIMM, modules_group))
+	// SMBIOS type 17's Configured Memory Voltage is a firmware-reported nominal,
+	// not a live rail. Many BIOSes leave it at the JEDEC value (1.2 V for DDR4)
+	// even when XMP/EXPO or a manual VDIMM setting is active.
+	app.memory_voltage_metric = u16(metric_add_computed(app, "SMBIOS Nominal Voltage", .Volts, .DIMM, modules_group))
+
+	dp := fmt_path(&path_buf, "%s/firmware/dmi/tables/DMI", app.sys_root)
+	info := smbios_memory(dp)
+	if info.ok {
+		memory_apply_identity(app, info)
+
+		if info.installed_mb > 0 {
+			idx := metric_add_computed(app, "Installed Capacity", .Gibibytes, .Other, usage_group)
+			metric_set_static(app, idx, f64(info.installed_mb) / 1024.0)
 		}
-		if app.ram_voltage_mv > 0 && app.memory_voltage_metric != NO_METRIC {
-			metric_set_static(app, int(app.memory_voltage_metric), f64(app.ram_voltage_mv) / 1000.0)
+
+		for d in 0 ..< info.dimm_count {
+			dimm := &info.dimms[d]
+			loc := label_str(dimm.locator[:], dimm.locator_len)
+			if len(loc) == 0 {
+				loc = fmt.bprintf(loc_buf[:], "DIMM %d", d)
+			}
+			lbl := fmt.bprintf(label_buf[:], "%s Capacity", loc)
+			idx := metric_add_computed(app, lbl, .Gibibytes, .DIMM, modules_group)
+			metric_set_static(app, idx, f64(dimm.size_mb) / 1024.0)
+			if dimm.speed_mt > 0 {
+				lbl = fmt.bprintf(label_buf[:], "%s Speed", loc)
+				idx = metric_add_computed(app, lbl, .MTs, .DIMM, modules_group)
+				metric_set_static(app, idx, f64(dimm.speed_mt))
+			}
 		}
 	} else {
 		// A missing table (non-x86) is not a permission problem; unreadable is.

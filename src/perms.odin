@@ -174,15 +174,7 @@ perms_apply_refresh :: proc(app: ^App) {
 	dp := fmt_path(&path_buf, "%s/firmware/dmi/tables/DMI", app.sys_root)
 	info := smbios_memory(dp)
 	if info.ok {
-		app.dmi_ok = true
-		app.ram_speed_mt = info.speed_mt
-		app.ram_voltage_mv = info.volt_mv
-		if app.memory_speed_metric != NO_METRIC {
-			metric_set_static(app, int(app.memory_speed_metric), f64(info.speed_mt))
-		}
-		if app.memory_voltage_metric != NO_METRIC {
-			metric_set_static(app, int(app.memory_voltage_metric), f64(info.volt_mv) / 1000.0)
-		}
+		memory_apply_identity(app, info)
 	}
 
 	sync.mutex_lock(&perms.mu)

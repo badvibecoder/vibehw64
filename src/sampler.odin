@@ -60,6 +60,7 @@ sampler_thread_proc :: proc(_: ^thread.Thread) {
 			sample_all(&app, dt)
 			usage_update(&app, dt)
 			net_update(&app, dt)
+			meminfo_update(&app, dt)
 
 			sync.mutex_lock(&sampler.mu)
 			sampler_publish_locked()

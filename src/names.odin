@@ -189,7 +189,9 @@ parse_hex_id :: proc(s: string) -> (u16, bool) {
 }
 
 // Streams pci.ids so the 1.6 MB file never has to be held in memory.
-pci_ids_lookup :: proc(vendor, device: u16, out: []u8) -> string {
+// When the subsystem vendor/device is known it prefers that entry (e.g. an
+// AIB model) over the generic vendor:device family name.
+pci_ids_lookup :: proc(vendor, device, subvendor, subdevice: u16, out: []u8) -> string {
 	fd, err := open_path("/usr/share/hwdata/pci.ids")
 	if err != .NONE {
 		return ""
@@ -198,14 +200,20 @@ pci_ids_lookup :: proc(vendor, device: u16, out: []u8) -> string {
 
 	vbuf: [8]u8
 	dbuf: [8]u8
+	svbuf: [8]u8
+	sdbuf: [8]u8
 	want_v := fmt.bprintf(vbuf[:], "%04x", vendor)
 	want_d := fmt.bprintf(dbuf[:], "%04x", device)
+	want_sv := fmt.bprintf(svbuf[:], "%04x", subvendor)
+	want_sd := fmt.bprintf(sdbuf[:], "%04x", subdevice)
 
 	chunk: [65536]u8
 	line: [192]u8
 	ln := 0
 	vendor_seen := false
-	name := ""
+	device_seen := false
+	device_name := ""
+	sub_name := ""
 
 	scan: for {
 		got, rerr := linux.read(fd, chunk[:])
@@ -223,13 +231,23 @@ pci_ids_lookup :: proc(vendor, device: u16, out: []u8) -> string {
 			}
 			if ln >= 5 && line[0] != '\t' && line[4] == ' ' {
 				vendor_seen = string(line[0:4]) == want_v
+				device_seen = false
 			} else if vendor_seen && ln >= 6 && line[0] == '\t' && line[1] != '\t' {
-				if string(line[1:5]) == want_d {
+				device_seen = string(line[1:5]) == want_d
+				if device_seen {
 					s := 5
 					for s < ln && (line[s] == ' ' || line[s] == '\t') {
 						s += 1
 					}
-					name = pick_short(string(line[s:ln]))
+					device_name = pick_short(string(line[s:ln]))
+				}
+			} else if device_seen && ln >= 12 && line[0] == '\t' && line[1] == '\t' {
+				if string(line[2:6]) == want_sv && string(line[7:11]) == want_sd {
+					s := 11
+					for s < ln && (line[s] == ' ' || line[s] == '\t') {
+						s += 1
+					}
+					sub_name = pick_short(string(line[s:ln]))
 					break scan
 				}
 			}
@@ -237,6 +255,10 @@ pci_ids_lookup :: proc(vendor, device: u16, out: []u8) -> string {
 		}
 	}
 
+	name := sub_name
+	if len(name) == 0 {
+		name = device_name
+	}
 	if len(name) == 0 {
 		return ""
 	}
@@ -284,12 +306,24 @@ smbios_string :: proc(buf: []u8, start: int, end: int, index: u8) -> string {
 	return ""
 }
 
+MAX_DIMMS :: 16
+
+SMB_Dimm :: struct {
+	size_mb:     int,
+	speed_mt:    int,
+	locator:     [32]u8,
+	locator_len: u8,
+}
+
 SMB_Memory :: struct {
-	ok:       bool,
-	speed_mt: int,
-	volt_mv:  int,
-	part:     string,
-	mixed:    bool,
+	ok:           bool,
+	speed_mt:     int,
+	volt_mv:      int,
+	part:         string,
+	mixed:        bool,
+	installed_mb: int,
+	dimm_count:   int,
+	dimms:        [MAX_DIMMS]SMB_Dimm,
 }
 
 smbios_part: [64]u8
@@ -312,6 +346,7 @@ smbios_memory :: proc(path: string) -> SMB_Memory {
 	part_len := 0
 	part_mixed := false
 	volt := 0
+	installed_mb := 0
 
 	i := 0
 	for i + 4 <= total {
@@ -329,7 +364,17 @@ smbios_memory :: proc(path: string) -> SMB_Memory {
 		}
 		if stype == 17 && length >= 0x16 {
 			size := u16(buf[i + 0x0C]) | (u16(buf[i + 0x0D]) << 8)
-			if size != 0 && size != 0xFFFF {
+			size_mb := int(size)
+			// 0x7FFF means the real size is in the Extended Size dword.
+			if size == 0x7FFF && length >= 0x20 {
+				size_mb = int(
+					u32(buf[i + 0x1C]) |
+					(u32(buf[i + 0x1D]) << 8) |
+					(u32(buf[i + 0x1E]) << 16) |
+					(u32(buf[i + 0x1F]) << 24),
+				)
+			}
+			if size_mb > 0 && size != 0xFFFF {
 				got := 0
 				// Configured Memory Speed (SMBIOS 3.3+) wins over the rated Speed.
 				if length >= 0x22 {
@@ -361,18 +406,33 @@ smbios_memory :: proc(path: string) -> SMB_Memory {
 						}
 					}
 				}
+
+				installed_mb += size_mb
+				if info.dimm_count < MAX_DIMMS {
+					d := &info.dimms[info.dimm_count]
+					d.size_mb = size_mb
+					d.speed_mt = got
+					if length > 0x10 {
+						loc := smbios_string(buf, i + length, j, buf[i + 0x10])
+						d.locator_len = label_set(d.locator[:], loc)
+					}
+					info.dimm_count += 1
+				}
 			}
 		}
 		i = j + 2
 	}
 
-	if speed_n == 0 {
+	if speed_n == 0 && info.dimm_count == 0 {
 		return info
 	}
 	info.ok = true
-	info.speed_mt = (speed_sum + speed_n / 2) / speed_n
+	if speed_n > 0 {
+		info.speed_mt = (speed_sum + speed_n / 2) / speed_n
+	}
 	info.volt_mv = volt
 	info.mixed = part_mixed
+	info.installed_mb = installed_mb
 	if part_len > 0 {
 		info.part = string(smbios_part[:part_len])
 	}

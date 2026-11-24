@@ -13,6 +13,13 @@ import rl "vendor:raylib"
 
 FONT_BYTES :: #load("assets/DejaVuSansMono.ttf")
 
+// Window icon, embedded at compile time so the binary stays self-contained.
+ICON_256 :: #load("assets/icon-256.png")
+ICON_64  :: #load("assets/icon-64.png")
+ICON_48  :: #load("assets/icon-48.png")
+ICON_32  :: #load("assets/icon-32.png")
+ICON_16  :: #load("assets/icon-16.png")
+
 WINDOW_W :: 760
 WINDOW_H :: 820
 FONT_SIZE :: f32(16.0)
@@ -46,6 +53,10 @@ COL_ACCENT  :: rl.Color{120, 178, 255, 255}
 COL_AMBER   :: rl.Color{236, 172, 62, 255}
 COL_RED     :: rl.Color{240, 84, 72, 255}
 COL_RED_DIM :: rl.Color{104, 30, 30, 255}
+COL_WHITE      :: rl.Color{255, 255, 255, 255}
+COL_TEMP_GREEN :: rl.Color{56, 142, 60, 255}
+COL_TEMP_ORANGE:: rl.Color{230, 120, 30, 255}
+COL_TEMP_RED   :: rl.Color{198, 40, 40, 255}
 
 ui_font:           rl.Font
 ui_scroll:         f32
@@ -54,6 +65,9 @@ ui_n:              int
 ui_interval_focus: bool
 ui_interval_buf:   [8]u8
 ui_interval_len:   int
+ui_copy_flash:     int
+ui_copy_buf:       [65536]u8
+ui_copy_len:       int
 
 ui_col_w:       [COL_COUNT]f32 = {340, 82, 82, 82, 82, 50}
 ui_last_w:      f32
@@ -65,6 +79,18 @@ ui_block_rows:  bool
 ui_frame:       int
 ui_banner_visible: bool
 ui_hover_boundary: int = -1
+
+ui_reset_rect :: proc() -> rl.Rectangle {
+	return {8, 6, 136, 22}
+}
+
+ui_copy_rect :: proc(w: f32) -> rl.Rectangle {
+	return {w - 84, 6, 76, 22}
+}
+
+ui_interval_field_rect :: proc() -> rl.Rectangle {
+	return {226, 6, 62, 22}
+}
 
 // ---------------------------------------------------------------------------
 // text helpers (raylib wants NUL-terminated strings)
@@ -201,7 +227,7 @@ ui_section_has_rows :: proc(si: int) -> bool {
 ui_group_count :: proc(si: int) -> int {
 	n := 0
 	for g in 0 ..< app.group_count {
-		if int(app.groups[g].section) == si {
+		if int(app.groups[g].section) == si && ui_rows_in_group(g) > 0 {
 			n += 1
 		}
 	}
@@ -216,6 +242,130 @@ ui_rows_in_group :: proc(gi: int) -> int {
 		}
 	}
 	return n
+}
+
+// ---------------------------------------------------------------------------
+// clipboard snapshot
+// ---------------------------------------------------------------------------
+
+ui_copy_add :: proc(format: string, args: ..any) {
+	tmp: [256]u8
+	s := fmt.bprintf(tmp[:], format, ..args)
+	room := len(ui_copy_buf) - 1 - ui_copy_len
+	if room <= 0 {
+		return
+	}
+	n := len(s)
+	if n > room {
+		n = room
+	}
+	for i in 0 ..< n {
+		ui_copy_buf[ui_copy_len + i] = s[i]
+	}
+	ui_copy_len += n
+}
+
+ui_copy_left :: proc(s: string, width: int) {
+	ui_copy_add("%s", s)
+	for i := len(s); i < width; i += 1 {
+		ui_copy_add(" ")
+	}
+}
+
+ui_copy_right :: proc(s: string, width: int) {
+	for i := len(s); i < width; i += 1 {
+		ui_copy_add(" ")
+	}
+	ui_copy_add("%s", s)
+}
+
+ui_copy_row :: proc(m: ^Sensor_Metric) {
+	label := label_str(m.label[:], m.label_len)
+	ui_copy_add("    ")
+	ui_copy_left(label, 30)
+	ui_copy_add(" ")
+
+	if m.src != NO_SOURCE && app.sources[m.src].root {
+		ui_copy_add("[Root Required]\n")
+		return
+	}
+	if !m.seen {
+		ui_copy_right("--", 10)
+		ui_copy_add("\n")
+		return
+	}
+
+	d := unit_decimals(m.unit)
+	b1, b2, b3, b4: [24]u8
+	cur := num_field(b1[:], m.cur, d, 10)
+	mn := num_field(b2[:], m.min, d, 10)
+	mx := num_field(b3[:], m.max, d, 10)
+	av := num_field(b4[:], metric_avg(m), d, 10)
+	ui_copy_add("%s %s %s %s  %s\n", cur, mn, mx, av, unit_str(m.unit))
+}
+
+ui_copy_build :: proc() -> int {
+	ui_copy_len = 0
+	ui_copy_buf[0] = 0
+
+	ui_copy_add("vibehw64 snapshot\n")
+	cpu := label_str(app.cpu_short[:], app.cpu_short_len)
+	if len(cpu) > 0 {
+		ui_copy_add("CPU: %s\n", cpu)
+	}
+	if app.gpu_short_len > 0 {
+		ui_copy_add("GPU: %s\n", label_str(app.gpu_short[:], app.gpu_short_len))
+	}
+	if app.ram_short_len > 0 {
+		ui_copy_add("Memory: %s\n", label_str(app.ram_short[:], app.ram_short_len))
+	}
+	ui_copy_add("Interval: %d ms\n\n", app.interval_ms)
+
+	ui_copy_add("    ")
+	ui_copy_left("Sensor", 30)
+	ui_copy_add(" ")
+	ui_copy_right("Current", 10)
+	ui_copy_add(" ")
+	ui_copy_right("Minimum", 10)
+	ui_copy_add(" ")
+	ui_copy_right("Maximum", 10)
+	ui_copy_add(" ")
+	ui_copy_right("Average", 10)
+	ui_copy_add("  Unit\n")
+	ui_copy_add("------------------------------------------------------------------------------\n")
+
+	for si in 0 ..< app.section_count {
+		if !ui_section_has_rows(si) {
+			continue
+		}
+		ui_copy_add("[%s]\n", app.sections[si].label)
+		gcount := ui_group_count(si)
+		for g in 0 ..< app.group_count {
+			if int(app.groups[g].section) != si {
+				continue
+			}
+			if ui_rows_in_group(g) == 0 {
+				continue
+			}
+			if gcount > 1 {
+				ui_copy_add("  %s\n", label_str(app.groups[g].label[:], app.groups[g].label_len))
+			}
+			for i in 0 ..< ui_n {
+				if int(ui_metrics[i].group) == g {
+					ui_copy_row(&ui_metrics[i])
+				}
+			}
+		}
+		ui_copy_add("\n")
+	}
+
+	ui_copy_buf[ui_copy_len] = 0
+	return ui_copy_len
+}
+
+ui_copy_snapshot :: proc() {
+	ui_copy_build()
+	rl.SetClipboardText(cstring(raw_data(ui_copy_buf[:])))
 }
 
 ui_content_height :: proc() -> f32 {
@@ -233,13 +383,17 @@ ui_content_height :: proc() -> f32 {
 			if int(app.groups[g].section) != si {
 				continue
 			}
+			rows := ui_rows_in_group(g)
+			if rows == 0 {
+				continue
+			}
 			if gcount > 1 {
 				h += ROW_H
 				if !app.groups[g].expanded {
 					continue
 				}
 			}
-			h += f32(ui_rows_in_group(g)) * ROW_H
+			h += f32(rows) * ROW_H
 		}
 	}
 	return h
@@ -255,6 +409,25 @@ ui_row_color :: proc(m: ^Sensor_Metric) -> rl.Color {
 			return COL_RED
 		}
 		if m.cur >= 85 {
+			return COL_AMBER
+		}
+	case .CPU_TjMax_Distance:
+		// Distance is inverted: keep the same 85/95 C thresholds as the
+		// temperature rows by converting back through this core's TjMax.
+		t := m.limit - m.cur
+		if t >= 95 {
+			return COL_RED
+		}
+		if t >= 85 {
+			return COL_AMBER
+		}
+	case .CPU_Max_Distance:
+		// Tcontrol is the recommended operating limit: at or above it is red,
+		// within 5 C of it is amber.
+		if m.cur <= 0 {
+			return COL_RED
+		}
+		if m.cur <= 5 {
 			return COL_AMBER
 		}
 	case .DIMM:
@@ -294,6 +467,45 @@ ui_row_color :: proc(m: ^Sensor_Metric) -> rl.Color {
 		}
 	}
 	return COL_TEXT
+}
+
+// Per-value bands for measured temperatures. Static limits and the distance
+// rows are excluded: their values are not live temperatures.
+ui_temp_band_value :: proc(m: ^Sensor_Metric, v: f64) -> (rl.Color, bool) {
+	if m.unit != .Celsius || !m.seen {
+		return {}, false
+	}
+	#partial switch m.class {
+	case .CPU_TjMax_Distance, .CPU_Max_Distance, .Temp_Limit:
+		return {}, false
+	}
+	if m.src != NO_SOURCE && app.sources[m.src].root {
+		return {}, false
+	}
+	if v >= 80 {
+		return COL_TEMP_RED, true
+	}
+	if v >= 70 {
+		return COL_TEMP_ORANGE, true
+	}
+	if v >= 60 {
+		return COL_TEMP_GREEN, true
+	}
+	return {}, false
+}
+
+ui_draw_value_cell :: proc(s: string, right, y: f32, m: ^Sensor_Metric, v: f64, base: rl.Color) {
+	band, highlighted := ui_temp_band_value(m, v)
+	if highlighted {
+		tw := ui_text_width(s, FONT_SIZE)
+		rl.DrawRectangleRec(
+			rl.Rectangle{right - tw - 5, y + 2, tw + 10, ROW_H - 4},
+			band,
+		)
+		ui_text(s, right - tw, y + 3, FONT_SIZE, COL_WHITE)
+	} else {
+		ui_text_right(s, right, y + 3, FONT_SIZE, base)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +609,7 @@ ui_draw_toolbar :: proc(w: f32) {
 	rl.DrawRectangleRec(rl.Rectangle{0, 0, w, TOOLBAR_H}, COL_PANEL)
 	rl.DrawRectangleRec(rl.Rectangle{0, TOOLBAR_H - 1, w, 1}, COL_BORDER)
 
-	reset := rl.Rectangle{8, 6, 136, 22}
+	reset := ui_reset_rect()
 	rl.DrawRectangleRec(reset, COL_BTN)
 	label := "Reset Min/Max"
 	ui_text(
@@ -408,10 +620,31 @@ ui_draw_toolbar :: proc(w: f32) {
 		COL_TEXT,
 	)
 
-	ui_text("Interval", 156, 10, FONT_SIZE, COL_DIM)
-	field := rl.Rectangle{226, 6, 62, 22}
-	rl.DrawRectangleRec(field, COL_FIELD)
+	copy := ui_copy_rect(w)
 	border := COL_BORDER
+	text_col := COL_TEXT
+	if ui_copy_flash > 0 {
+		border = COL_ACCENT
+		text_col = COL_ACCENT
+	}
+	rl.DrawRectangleRec(copy, COL_BTN)
+	rl.DrawRectangleLinesEx(copy, 1, border)
+	copy_label := "Copy"
+	if ui_copy_flash > 0 {
+		copy_label = "Copied"
+	}
+	ui_text(
+		copy_label,
+		copy.x + (copy.width - ui_text_width(copy_label, FONT_SIZE)) / 2,
+		10,
+		FONT_SIZE,
+		text_col,
+	)
+
+	ui_text("Interval", 156, 10, FONT_SIZE, COL_DIM)
+	field := ui_interval_field_rect()
+	rl.DrawRectangleRec(field, COL_FIELD)
+	border = COL_BORDER
 	if ui_interval_focus {
 		border = COL_ACCENT
 	}
@@ -518,13 +751,16 @@ ui_draw_row :: proc(m: ^Sensor_Metric, y: f32, w: f32, alt: bool) {
 		return
 	}
 
-	col := ui_row_color(m)
 	d := unit_decimals(m.unit)
 	b1, b2, b3, b4: [24]u8
-	ui_text_right(ui_num_str(b1[:], m.cur, d), ui_col_right(x, COL_CUR), y + 3, FONT_SIZE, col)
-	ui_text_right(ui_num_str(b2[:], m.min, d), ui_col_right(x, COL_MIN_C), y + 3, FONT_SIZE, COL_DIM)
-	ui_text_right(ui_num_str(b3[:], m.max, d), ui_col_right(x, COL_MAX_C), y + 3, FONT_SIZE, COL_DIM)
-	ui_text_right(ui_num_str(b4[:], metric_avg(m), d), ui_col_right(x, COL_AVG), y + 3, FONT_SIZE, COL_DIM)
+	cur := ui_num_str(b1[:], m.cur, d)
+	mn := ui_num_str(b2[:], m.min, d)
+	mx := ui_num_str(b3[:], m.max, d)
+	av := ui_num_str(b4[:], metric_avg(m), d)
+	ui_draw_value_cell(cur, ui_col_right(x, COL_CUR), y, m, m.cur, ui_row_color(m))
+	ui_draw_value_cell(mn, ui_col_right(x, COL_MIN_C), y, m, m.min, COL_DIM)
+	ui_draw_value_cell(mx, ui_col_right(x, COL_MAX_C), y, m, m.max, COL_DIM)
+	ui_draw_value_cell(av, ui_col_right(x, COL_AVG), y, m, metric_avg(m), COL_DIM)
 	ui_text(unit_str(m.unit), x[COL_UNIT] + 2, y + 3, FONT_SIZE, COL_DIM)
 }
 
@@ -556,6 +792,9 @@ ui_draw_content :: proc(w: f32, h: f32) {
 		gcount := ui_group_count(si)
 		for g in 0 ..< app.group_count {
 			if int(app.groups[g].section) != si {
+				continue
+			}
+			if ui_rows_in_group(g) == 0 {
 				continue
 			}
 			if gcount > 1 {
@@ -704,9 +943,14 @@ ui_handle_input :: proc(w: f32, h: f32, content: f32) -> bool {
 	}
 
 	if rl.IsMouseButtonPressed(.LEFT) && !ui_block_rows {
-		reset := rl.Rectangle{8, 6, 136, 22}
-		field := rl.Rectangle{226, 6, 62, 22}
-		if rl.CheckCollisionPointRec(mouse, reset) {
+		reset := ui_reset_rect()
+		copy := ui_copy_rect(w)
+		field := ui_interval_field_rect()
+		if rl.CheckCollisionPointRec(mouse, copy) {
+			ui_copy_snapshot()
+			ui_copy_flash = 15
+			ui_interval_focus = false
+		} else if rl.CheckCollisionPointRec(mouse, reset) {
 			sampler_reset()
 			ui_interval_focus = false
 		} else if rl.CheckCollisionPointRec(mouse, field) {
@@ -718,7 +962,7 @@ ui_handle_input :: proc(w: f32, h: f32, content: f32) -> bool {
 
 	// Text-entry cursor over the interval field, unless a column line is active.
 	if ui_hover_boundary <= 0 && !ui_block_rows {
-		field := rl.Rectangle{226, 6, 62, 22}
+		field := ui_interval_field_rect()
 		if rl.CheckCollisionPointRec(mouse, field) {
 			rl.SetMouseCursor(.IBEAM)
 		}
@@ -795,6 +1039,9 @@ ui_draw_frame :: proc() {
 		net_refresh_wifi(&app)
 	}
 	ui_frame += 1
+	if ui_copy_flash > 0 {
+		ui_copy_flash -= 1
+	}
 	content := ui_content_height()
 	ui_handle_input(w, h, content)
 
@@ -825,6 +1072,36 @@ ui_draw_frame :: proc() {
 // entry point
 // ---------------------------------------------------------------------------
 
+// Hands the embedded PNGs to the window manager. GLFW copies the pixels, so the
+// raylib images can be unloaded immediately afterwards. Native Wayland ignores
+// runtime window icons (it resolves them from a .desktop file), so this takes
+// effect under X11/XWayland only.
+ui_set_window_icon :: proc() {
+	icons := [5]rl.Image {
+		rl.LoadImageFromMemory(".png", raw_data(ICON_256), c.int(len(ICON_256))),
+		rl.LoadImageFromMemory(".png", raw_data(ICON_64), c.int(len(ICON_64))),
+		rl.LoadImageFromMemory(".png", raw_data(ICON_48), c.int(len(ICON_48))),
+		rl.LoadImageFromMemory(".png", raw_data(ICON_32), c.int(len(ICON_32))),
+		rl.LoadImageFromMemory(".png", raw_data(ICON_16), c.int(len(ICON_16))),
+	}
+	valid: [5]rl.Image
+	n := 0
+	for i in 0 ..< len(icons) {
+		if rl.IsImageReady(icons[i]) {
+			valid[n] = icons[i]
+			n += 1
+		}
+	}
+	if n > 0 {
+		rl.SetWindowIcons(&valid[0], c.int(n))
+	}
+	for i in 0 ..< len(icons) {
+		if rl.IsImageReady(icons[i]) {
+			rl.UnloadImage(icons[i])
+		}
+	}
+}
+
 ui_title_buf: [128]u8
 
 ui_title :: proc() -> cstring {
@@ -847,6 +1124,7 @@ run_ui :: proc() -> bool {
 		return false
 	}
 	rl.SetWindowMinSize(640, 480)
+	ui_set_window_icon()
 	rl.SetTargetFPS(10)
 
 	ui_font = rl.LoadFontFromMemory(

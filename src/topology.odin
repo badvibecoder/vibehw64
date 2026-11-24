@@ -18,7 +18,7 @@ import "core:sys/linux"
 
 MAX_CPUS    :: 256
 MAX_CLASSES :: 8
-MAX_LABEL   :: 40
+MAX_LABEL   :: 48
 
 Core :: struct {
 	cpu:     u16,

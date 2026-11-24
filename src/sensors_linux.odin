@@ -13,8 +13,8 @@ import "core:time"
 
 MAX_SENSORS   :: 512
 MAX_SOURCES   :: 512
-MAX_GROUPS    :: 16
-MAX_SECTIONS :: 24
+MAX_GROUPS    :: 128
+MAX_SECTIONS  :: 64
 
 Sensor_Unit :: enum u8 {
 	MHz,
@@ -27,13 +27,18 @@ Sensor_Unit :: enum u8 {
 	MTs,
 	Gigabytes,
 	Terabytes,
+	Gibibytes,
 	Mbps,
 	DBm,
+	Seconds,
+	Milliseconds,
 }
 
 Sensor_Class :: enum u8 {
 	CPU_Pkg,
 	CPU_Core,
+	CPU_TjMax_Distance,
+	CPU_Max_Distance,
 	DIMM,
 	GPU_Edge,
 	GPU_Junction,
@@ -45,6 +50,7 @@ Sensor_Class :: enum u8 {
 	Voltage,
 	Drive,
 	Other,
+	Temp_Limit,
 }
 
 Parse_Kind :: enum u8 {
@@ -58,10 +64,7 @@ Parse_Kind :: enum u8 {
 }
 
 Section_Id :: enum u8 {
-	CPU_Pkg_Power,
-	CPU_Clocks,
-	CPU_Usage,
-	CPU_Temps,
+	CPU,
 	Memory,
 	GPU,
 	Voltages,
@@ -97,18 +100,20 @@ Sensor_Source :: struct {
 }
 
 Sensor_Metric :: struct {
-	label:     [MAX_LABEL]u8,
-	label_len: u8,
-	unit:      Sensor_Unit,
-	class:     Sensor_Class,
-	group:     u8,
-	src:       u16,
-	cur:       f64,
-	min:       f64,
-	max:       f64,
-	wsum:      f64,
-	wtime:     f64,
-	seen:      bool,
+	label:        [MAX_LABEL]u8,
+	label_len:    u8,
+	unit:         Sensor_Unit,
+	class:        Sensor_Class,
+	group:        u8,
+	src:          u16,
+	derived_from: u16, // source metric for derived rows (NO_METRIC if none)
+	limit:        f64, // TjMax for distance rows
+	cur:          f64,
+	min:          f64,
+	max:          f64,
+	wsum:         f64,
+	wtime:        f64,
+	seen:         bool,
 }
 
 App :: struct {
@@ -161,6 +166,7 @@ metric_add_computed :: proc(app: ^App, label: string, unit: Sensor_Unit, class: 
 	m.class = class
 	m.group = group
 	m.src = NO_SOURCE
+	m.derived_from = NO_METRIC
 	app.metric_count += 1
 	return app.metric_count - 1
 }
@@ -181,9 +187,9 @@ source_add :: proc(app: ^App, fd: linux.Fd, kind: Parse_Kind, scale: f64, usable
 	return app.source_count - 1
 }
 
-metric_add :: proc(app: ^App, label: string, unit: Sensor_Unit, class: Sensor_Class, group: u8, si: int) {
+metric_add :: proc(app: ^App, label: string, unit: Sensor_Unit, class: Sensor_Class, group: u8, si: int) -> int {
 	if app.metric_count >= MAX_SENSORS || si < 0 {
-		return
+		return -1
 	}
 	m := &app.metrics[app.metric_count]
 	m.label_len = label_set(m.label[:], label)
@@ -191,7 +197,27 @@ metric_add :: proc(app: ^App, label: string, unit: Sensor_Unit, class: Sensor_Cl
 	m.class = class
 	m.group = group
 	m.src = u16(si)
+	m.derived_from = NO_METRIC
 	app.metric_count += 1
+	return app.metric_count - 1
+}
+
+	add_derived_row :: proc(
+	app: ^App,
+	label: string,
+	class: Sensor_Class,
+	group: u8,
+	src: int,
+	limit: f64,
+) {
+	if src < 0 {
+		return
+	}
+	di := metric_add_computed(app, label, .Celsius, class, group)
+	if di >= 0 {
+		app.metrics[di].derived_from = u16(src)
+		app.metrics[di].limit = limit
+	}
 }
 
 open_sensor :: proc(path: string) -> (linux.Fd, bool) {
@@ -301,6 +327,22 @@ metric_set_static :: proc(app: ^App, idx: int, v: f64) {
 	m.seen = true
 }
 
+// Derived rows reuse an already-sampled metric instead of opening a second fd.
+// TjMax distance is the first user: crit is static, the temperature is not.
+derived_update :: proc(app: ^App, dt_sec: f64) {
+	for i in 0 ..< app.metric_count {
+		m := &app.metrics[i]
+		if m.derived_from == NO_METRIC {
+			continue
+		}
+		src := &app.metrics[m.derived_from]
+		if !src.seen {
+			continue
+		}
+		metric_push(app, i, m.limit - src.cur, dt_sec)
+	}
+}
+
 sample_all :: proc(app: ^App, dt_sec: f64) {
 	for i in 0 ..< app.metric_count {
 		if app.metrics[i].src == NO_SOURCE {
@@ -312,6 +354,7 @@ sample_all :: proc(app: ^App, dt_sec: f64) {
 		}
 		metric_push(app, i, v, dt_sec)
 	}
+	derived_update(app, dt_sec)
 }
 
 metric_avg :: proc(m: ^Sensor_Metric) -> f64 {
@@ -360,6 +403,14 @@ set_section_label_at :: proc(app: ^App, idx: u8, label: string) {
 	app.sections[idx].label = fmt.bprintf(buf[:], "%s", label)
 }
 
+set_group_label_at :: proc(app: ^App, idx: u8, label: string) {
+	if int(idx) >= app.group_count {
+		return
+	}
+	g := &app.groups[idx]
+	g.label_len = label_set(g.label[:], label)
+}
+
 group_add_at :: proc(app: ^App, section: u8, label: string, expanded: bool) -> u8 {
 	i := app.group_count
 	if i >= MAX_GROUPS {
@@ -391,11 +442,12 @@ discover_build_labels :: proc(app: ^App) {
 	if app.ram_speed_mt > 0 && app.ram_jedec_mt > 0 && app.ram_speed_mt > app.ram_jedec_mt {
 		ram_n = fmt.bprintf(profile_buf[:], "%s  XMP/EXPO", ram_n)
 	}
-	set_section_label(app, .CPU_Pkg_Power, "CPU Package & Power", cpu_n)
-	set_section_label(app, .CPU_Clocks, "CPU Core Clocks", cpu_n)
-	set_section_label(app, .CPU_Usage, "CPU Core Usage", cpu_n)
-	set_section_label(app, .CPU_Temps, "CPU Core Temperatures", cpu_n)
-	set_section_label(app, .Memory, "Memory (DDR5 SPD)", ram_n)
+	set_section_label(app, .CPU, "CPU", cpu_n)
+	mem_base := "Memory"
+	if app.ram_jedec_mt > 0 {
+		mem_base = "Memory (DDR5 SPD)"
+	}
+	set_section_label(app, .Memory, mem_base, ram_n)
 	set_section_label(app, .GPU, "GPU (AMD)", gpu_n)
 	set_section_label(app, .Voltages, "CPU & Board Voltages", "")
 }
@@ -410,10 +462,7 @@ discover_all :: proc(app: ^App, sys_root: string) -> bool {
 	app.metric_count = 0
 	app.source_count = 0
 	// Fixed sections, added in Section_Id order so enum values stay valid.
-	section_add(app, "CPU Package & Power", true)
-	section_add(app, "CPU Core Clocks", true)
-	section_add(app, "CPU Core Usage", true)
-	section_add(app, "CPU Core Temperatures", true)
+	section_add(app, "CPU", true)
 	section_add(app, "Memory (DDR5 SPD)", true)
 	section_add(app, "GPU (AMD)", true)
 	section_add(app, "CPU & Board Voltages", true)
@@ -428,32 +477,69 @@ discover_all :: proc(app: ^App, sys_root: string) -> bool {
 		app.cpu_short_len = label_set(app.cpu_short[:], cpu_short_name(model, scratch[:]))
 	}
 
-	pkg_g := group_add(app, .CPU_Pkg_Power, "CPU Package & Power", true)
-	mem_g := group_add(app, .Memory, "Memory", true)
+	pkg_g := group_add(app, .CPU, "Package & Power", true)
+	thermal_pkg_g := group_add(app, .CPU, "Thermal Headroom - Package", true)
+	mem_usage_g := group_add(app, .Memory, "Usage", true)
+	mem_modules_g := group_add(app, .Memory, "Modules", true)
+	mem_temp_g := group_add(app, .Memory, "Temperatures", true)
 	gpu_g := group_add(app, .GPU, "GPU", true)
 
 	clock_g: [MAX_CLASSES]u8
 	temp_g: [MAX_CLASSES]u8
 	usage_g: [MAX_CLASSES]u8
+	tj_g: [MAX_CLASSES]u8
+	max_g: [MAX_CLASSES]u8
+	g_lab: [MAX_LABEL]u8
+
 	for ci in 0 ..< app.topo.class_count {
 		lab := class_label(&app.topo, u8(ci))
 		exp := app.topo.classes[ci].expanded
-		clock_g[ci] = group_add(app, .CPU_Clocks, lab, exp)
-		temp_g[ci] = group_add(app, .CPU_Temps, lab, exp)
-		usage_g[ci] = group_add(app, .CPU_Usage, lab, exp)
+		lbl := fmt_label(&g_lab, "CPU Core Clocks - %s", lab)
+		clock_g[ci] = group_add(app, .CPU, lbl, exp)
+	}
+	for ci in 0 ..< app.topo.class_count {
+		lab := class_label(&app.topo, u8(ci))
+		exp := app.topo.classes[ci].expanded
+		lbl := fmt_label(&g_lab, "CPU Core Usage - %s", lab)
+		usage_g[ci] = group_add(app, .CPU, lbl, exp)
+	}
+	for ci in 0 ..< app.topo.class_count {
+		lab := class_label(&app.topo, u8(ci))
+		exp := app.topo.classes[ci].expanded
+		lbl := fmt_label(&g_lab, "CPU Core Temperatures - %s", lab)
+		temp_g[ci] = group_add(app, .CPU, lbl, exp)
+	}
+
+	for ci in 0 ..< app.topo.class_count {
+		lab := class_label(&app.topo, u8(ci))
+		exp := app.topo.classes[ci].expanded
+		tj_lab := fmt_label(&g_lab, "%s - Distance from TjMax", lab)
+		tj_g[ci] = group_add(app, .CPU, tj_lab, exp)
+		max_lab := fmt_label(&g_lab, "%s - Distance from Tcontrol", lab)
+		max_g[ci] = group_add(app, .CPU, max_lab, exp)
 	}
 	volt_g := group_add(app, .Voltages, "Voltages", true)
 
 	discover_clocks(app, clock_g[:])
-	discover_temps(app, temp_g[:], pkg_g)
+	discover_temps(app, temp_g[:], pkg_g,
+		Temp_Groups{core = tj_g[:], pkg = thermal_pkg_g},
+		Temp_Groups{core = max_g[:], pkg = thermal_pkg_g})
 	usage_init(app, usage_g[:], pkg_g)
 	discover_rapl(app, pkg_g)
-	discover_spd(app, mem_g)
+	discover_spd(app, mem_temp_g)
 	discover_gpu(app, gpu_g)
 	discover_voltages(app, volt_g)
-	discover_memory_info(app, mem_g)
+	discover_memory_info(app, mem_usage_g, mem_modules_g)
+	meminfo_init(app, mem_usage_g)
 	discover_storage(app)
 	discover_net(app)
+
+	// Keep the generic board/peripheral sensors at the very bottom of the list.
+	other_sec := section_add(app, "Other Sensors", true)
+	other_temp_g := group_add_at(app, other_sec, "Temperatures", true)
+	other_fan_g := group_add_at(app, other_sec, "Fans", true)
+	discover_other_sensors(app, other_temp_g, other_fan_g)
+
 	discover_build_labels(app)
 
 	return app.metric_count > 0
@@ -482,19 +568,53 @@ discover_clocks :: proc(app: ^App, groups: []u8) {
 }
 
 Temp_Entry :: struct {
-	fd:      linux.Fd,
-	core_id: i32,
-	has_id:  bool,
-	raw:     [MAX_LABEL]u8,
-	raw_len: u8,
+	fd:           linux.Fd,
+	core_id:      i32,
+	has_id:       bool,
+	crit:         f64,
+	has_crit:     bool,
+	max_temp:     f64,
+	has_max_temp: bool,
+	raw:          [MAX_LABEL]u8,
+	raw_len:      u8,
 }
 
-discover_temps :: proc(app: ^App, groups: []u8, pkg_group: u8) {
+Temp_Groups :: struct {
+	core: []u8,
+	pkg:  u8,
+}
+
+// coretemp documents tempX_crit as TjMax and tempX_max as Tcontrol, the
+// recommended operating limit at which all cooling devices should be on.
+read_temp_limit :: proc(app: ^App, h: int, i: int, which: string) -> (f64, bool) {
+	path_buf: [512]u8
+	buf: [64]u8
+	p := fmt_path(&path_buf, "%s/class/hwmon/hwmon%d/temp%d_%s", app.sys_root, h, i, which)
+	s, ok := read_file_str(p, buf[:])
+	if !ok {
+		return 0, false
+	}
+	v, vok := strconv.parse_int(trim_ws(s), 10)
+	if !vok || v <= 0 {
+		return 0, false
+	}
+	return f64(v) / 1000.0, true
+}
+
+discover_temps :: proc(
+	app: ^App,
+	groups: []u8,
+	pkg_group: u8,
+	tj: Temp_Groups,
+	tmax: Temp_Groups,
+) {
 	path_buf: [512]u8
 	name_buf: [256]u8
 	label_buf: [MAX_LABEL]u8
 	entries: [MAX_CPUS]Temp_Entry
 	n := 0
+	pkg_crit: f64 = 0
+	pkg_tmax: f64 = 0
 
 	for h in 0 ..< 64 {
 		p := fmt_path(&path_buf, "%s/class/hwmon/hwmon%d/name", app.sys_root, h)
@@ -518,7 +638,21 @@ discover_temps :: proc(app: ^App, groups: []u8, pkg_group: u8) {
 
 			if len(lab) >= 10 && lab[:10] == "Package id" {
 				si := source_add(app, fd, .Milli_Int, 0.001, true)
-				metric_add(app, "Package Temp", .Celsius, .CPU_Pkg, pkg_group, si)
+				mi := metric_add(app, "Package Temp", .Celsius, .CPU_Pkg, pkg_group, si)
+				if mi >= 0 {
+					if crit, cok := read_temp_limit(app, h, i, "crit"); cok {
+						pkg_crit = crit
+						ti := metric_add_computed(app, "TjMax", .Celsius, .Temp_Limit, tj.pkg)
+						metric_set_static(app, ti, crit)
+						add_derived_row(app, "Distance from TjMax", .CPU_TjMax_Distance, tj.pkg, mi, crit)
+					}
+					if tmax_v, tok := read_temp_limit(app, h, i, "max"); tok {
+						pkg_tmax = tmax_v
+						ti := metric_add_computed(app, "Tcontrol", .Celsius, .Temp_Limit, tmax.pkg)
+						metric_set_static(app, ti, tmax_v)
+						add_derived_row(app, "Distance from Tcontrol", .CPU_Max_Distance, tmax.pkg, mi, tmax_v)
+					}
+				}
 				continue
 			}
 			if len(lab) > 5 && lab[:5] == "Core " {
@@ -529,15 +663,40 @@ discover_temps :: proc(app: ^App, groups: []u8, pkg_group: u8) {
 				e := &entries[n]
 				e.fd = fd
 				e.has_id = false
+				e.has_crit = false
+				e.crit = 0
+				e.has_max_temp = false
+				e.max_temp = 0
 				e.raw_len = label_set(e.raw[:], lab)
 				if v, vok := strconv.parse_int(lab[5:], 10); vok {
 					e.core_id = i32(v)
 					e.has_id = true
 				}
+				if crit, cok := read_temp_limit(app, h, i, "crit"); cok {
+					e.crit = crit
+					e.has_crit = true
+				}
+				if tmax_v, tok := read_temp_limit(app, h, i, "max"); tok {
+					e.max_temp = tmax_v
+					e.has_max_temp = true
+				}
 				n += 1
 				continue
 			}
 			linux.close(fd)
+		}
+	}
+
+	// Put the real package limits in the per-class subsection headers.
+	for ci in 0 ..< app.topo.class_count {
+		base := class_label(&app.topo, u8(ci))
+		if pkg_crit > 0 {
+			lbl := fmt_label(&label_buf, "%s - Distance from TjMax (%.1f C)", base, pkg_crit)
+			set_group_label_at(app, tj.core[ci], lbl)
+		}
+		if pkg_tmax > 0 {
+			lbl := fmt_label(&label_buf, "%s - Distance from Tcontrol (%.1f C)", base, pkg_tmax)
+			set_group_label_at(app, tmax.core[ci], lbl)
 		}
 	}
 
@@ -560,10 +719,26 @@ discover_temps :: proc(app: ^App, groups: []u8, pkg_group: u8) {
 			core := &app.topo.cores[ci]
 			tag := class_tag(&app.topo, core.class)
 			lbl := fmt_label(&label_buf, "Core %d [%s]", core.cpu, tag)
-			metric_add(app, lbl, .Celsius, .CPU_Core, groups[core.class], si)
+			mi := metric_add(app, lbl, .Celsius, .CPU_Core, groups[core.class], si)
+			if mi >= 0 {
+				if e.has_crit {
+					add_derived_row(app, lbl, .CPU_TjMax_Distance, tj.core[core.class], mi, e.crit)
+				}
+				if e.has_max_temp {
+					add_derived_row(app, lbl, .CPU_Max_Distance, tmax.core[core.class], mi, e.max_temp)
+				}
+			}
 		} else {
 			raw := label_str(e.raw[:], e.raw_len)
-			metric_add(app, raw, .Celsius, .CPU_Core, groups[0], si)
+			mi := metric_add(app, raw, .Celsius, .CPU_Core, groups[0], si)
+			if mi >= 0 {
+				if e.has_crit {
+					add_derived_row(app, raw, .CPU_TjMax_Distance, tj.core[0], mi, e.crit)
+				}
+				if e.has_max_temp {
+					add_derived_row(app, raw, .CPU_Max_Distance, tmax.core[0], mi, e.max_temp)
+				}
+			}
 		}
 	}
 }
@@ -601,6 +776,59 @@ add_power_metric :: proc(app: ^App, label: string, dir: string, group: u8) {
 	metric_add(app, label, .Watts, .CPU_Pkg, group, si)
 }
 
+// PL1/PL2 and their time windows, read once and published as static rows.
+// The kernel names the constraints, so match long_term/short_term rather than
+// trusting index order (some platforms also expose a peak/PL4 constraint).
+add_power_limit_rows :: proc(app: ^App, group: u8, pkg_dir: string) {
+	path_buf: [512]u8
+	name_buf: [64]u8
+	val_buf: [64]u8
+	label_buf: [MAX_LABEL]u8
+
+	for c in 0 ..< 3 {
+		np := fmt_path(&path_buf, "%s/constraint_%d_name", pkg_dir, c)
+		ns, ok := read_file_str(np, name_buf[:])
+		if !ok {
+			continue
+		}
+		nm := trim_ws(ns)
+		pl: string
+		if nm == "long_term" {
+			pl = "PL1"
+		} else if nm == "short_term" {
+			pl = "PL2"
+		} else {
+			continue
+		}
+
+		lp := fmt_path(&path_buf, "%s/constraint_%d_power_limit_uw", pkg_dir, c)
+		if ls, lok := read_file_str(lp, val_buf[:]); lok {
+			if uw, uok := strconv.parse_int(trim_ws(ls), 10); uok && uw > 0 {
+				lbl := fmt_label(&label_buf, "%s Power Limit", pl)
+				idx := metric_add_computed(app, lbl, .Watts, .CPU_Pkg, group)
+				metric_set_static(app, idx, f64(uw) / 1.0e6)
+			}
+		}
+
+		wp := fmt_path(&path_buf, "%s/constraint_%d_time_window_us", pkg_dir, c)
+		if ws, wok := read_file_str(wp, val_buf[:]); wok {
+			if us, uok := strconv.parse_int(trim_ws(ws), 10); uok && us > 0 {
+				// TAU windows range from milliseconds to tens of seconds;
+				// pick the unit that keeps the number readable.
+				unit := Sensor_Unit.Seconds
+				val := f64(us) / 1.0e6
+				if us < 1_000_000 {
+					unit = .Milliseconds
+					val = f64(us) / 1.0e3
+				}
+				lbl := fmt_label(&label_buf, "%s Time Window", pl)
+				idx := metric_add_computed(app, lbl, unit, .CPU_Pkg, group)
+				metric_set_static(app, idx, val)
+			}
+		}
+	}
+}
+
 // RAPL. intel-rapl and intel-rapl-mmio mirror the same counters, so only one
 // prefix is used: the MSR-backed tree when present.
 discover_rapl :: proc(app: ^App, pkg_group: u8) {
@@ -633,6 +861,10 @@ discover_rapl :: proc(app: ^App, pkg_group: u8) {
 
 	pkg_dir := fmt_path(&path_buf, "%s/class/powercap/%s:%d", app.sys_root, dom_prefix, dom)
 	add_power_metric(app, "Package Power", pkg_dir, pkg_group)
+	// pkg_dir aliases path_buf, which the loop below reuses; keep a copy so the
+	// limit rows can be appended after the measured power rows.
+	pkg_copy: [256]u8
+	pkg_len := label_set(pkg_copy[:], pkg_dir)
 
 	for j in 0 ..< 8 {
 		p := fmt_path(&path_buf, "%s/class/powercap/%s:%d:%d/name", app.sys_root, dom_prefix, dom, j)
@@ -646,6 +878,8 @@ discover_rapl :: proc(app: ^App, pkg_group: u8) {
 			break
 		}
 	}
+
+	add_power_limit_rows(app, pkg_group, label_str(pkg_copy[:], pkg_len))
 }
 
 i2c_addr_from_target :: proc(s: string) -> (u32, bool) {
@@ -823,8 +1057,32 @@ discover_gpu :: proc(app: ^App, group: u8) {
 		dp := fmt_path(&path_buf, "%s/class/drm/card%d/device/device", app.sys_root, ci)
 		if ds, dok := read_file_str(dp, name_buf[:]); dok {
 			if id, iok := parse_hex_id(trim_ws(ds)); iok {
+				sub_v: u16
+				sub_d: u16
+				sv_ok := false
+				sd_ok := false
+				svp := fmt_path(&path_buf, "%s/class/drm/card%d/device/subsystem_vendor", app.sys_root, ci)
+				if ss, ok := read_file_str(svp, name_buf[:]); ok {
+					if v, pok := parse_hex_id(trim_ws(ss)); pok {
+						sub_v = v
+						sv_ok = true
+					}
+				}
+				sdp := fmt_path(&path_buf, "%s/class/drm/card%d/device/subsystem_device", app.sys_root, ci)
+				if ss, ok := read_file_str(sdp, name_buf[:]); ok {
+					if v, pok := parse_hex_id(trim_ws(ss)); pok {
+						sub_d = v
+						sd_ok = true
+					}
+				}
 				scratch: [96]u8
-				if nm := pci_ids_lookup(0x1002, id, scratch[:]); len(nm) > 0 {
+				nm: string
+				if sv_ok && sd_ok {
+					nm = pci_ids_lookup(0x1002, id, sub_v, sub_d, scratch[:])
+				} else {
+					nm = pci_ids_lookup(0x1002, id, 0, 0, scratch[:])
+				}
+				if len(nm) > 0 {
 					app.gpu_short_len = label_set(app.gpu_short[:], nm)
 				}
 			}
@@ -833,6 +1091,16 @@ discover_gpu :: proc(app: ^App, group: u8) {
 		if fd, fok := open_sensor(bp); fok {
 			si := source_add(app, fd, .Pct_Int, 1, true)
 			metric_add(app, "GPU Usage", .Percent, .GPU_Busy, group, si)
+		}
+		up := fmt_path(&path_buf, "%s/class/drm/card%d/device/mem_info_vram_used", app.sys_root, ci)
+		if fd, fok := open_sensor(up); fok {
+			si := source_add(app, fd, .Raw_Int, 1.0 / 1073741824.0, true)
+			metric_add(app, "VRAM Used", .Gibibytes, .GPU_Mem, group, si)
+		}
+		tp := fmt_path(&path_buf, "%s/class/drm/card%d/device/mem_info_vram_total", app.sys_root, ci)
+		if fd, fok := open_sensor(tp); fok {
+			si := source_add(app, fd, .Raw_Int, 1.0 / 1073741824.0, true)
+			metric_add(app, "VRAM Total", .Gibibytes, .GPU_Mem, group, si)
 		}
 		break
 	}
@@ -878,6 +1146,87 @@ discover_voltages :: proc(app: ^App, group: u8) {
 	}
 }
 
+hwmon_claimed :: proc(name: string) -> bool {
+	return name == "coretemp" ||
+		name == "amdgpu" ||
+		name == "spd5118" ||
+		name == "jc42" ||
+		name == "nvme" ||
+		name == "drivetemp"
+}
+
+// Generic hwmon temperatures and fans. Everything already handled by a more
+// specific section (CPU, GPU, DIMMs, drives) is skipped; what remains is the
+// board/NIC/Wi-Fi/EC long tail.
+discover_other_sensors :: proc(app: ^App, temp_group: u8, fan_group: u8) {
+	path_buf: [512]u8
+	name_buf: [64]u8
+	idx_buf: [64]u8
+	label_buf: [MAX_LABEL]u8
+	dev_buf: [32]u8
+
+	for h in 0 ..< 64 {
+		np := fmt_path(&path_buf, "%s/class/hwmon/hwmon%d/name", app.sys_root, h)
+		ns, ok := read_file_str(np, name_buf[:])
+		if !ok {
+			continue
+		}
+		name := trim_ws(ns)
+		if len(name) == 0 || hwmon_claimed(name) {
+			continue
+		}
+		if name == "acpitz" {
+			name = "ACPI Zone"
+		}
+		dev_len := label_set(dev_buf[:], name)
+		dev := label_str(dev_buf[:], dev_len)
+
+		for i in 1 ..= 16 {
+			vp := fmt_path(&path_buf, "%s/class/hwmon/hwmon%d/temp%d_input", app.sys_root, h, i)
+			fd, fok := open_sensor(vp)
+			if !fok {
+				continue
+			}
+			lbl: string
+			lab := ""
+			lp := fmt_path(&path_buf, "%s/class/hwmon/hwmon%d/temp%d_label", app.sys_root, h, i)
+			if ls, lok := read_file_str(lp, idx_buf[:]); lok {
+				lab = trim_ws(ls)
+			}
+			if len(lab) > 0 {
+				lbl = fmt_label(&label_buf, "%s %s", dev, lab)
+			} else if i == 1 {
+				lbl = fmt_label(&label_buf, "%s Temperature", dev)
+			} else {
+				lbl = fmt_label(&label_buf, "%s temp%d", dev, i)
+			}
+			si := source_add(app, fd, .Milli_Int, 0.001, true)
+			metric_add(app, lbl, .Celsius, .Other, temp_group, si)
+		}
+
+		for i in 1 ..= 16 {
+			vp := fmt_path(&path_buf, "%s/class/hwmon/hwmon%d/fan%d_input", app.sys_root, h, i)
+			fd, fok := open_sensor(vp)
+			if !fok {
+				continue
+			}
+			lbl: string
+			lab := ""
+			lp := fmt_path(&path_buf, "%s/class/hwmon/hwmon%d/fan%d_label", app.sys_root, h, i)
+			if ls, lok := read_file_str(lp, idx_buf[:]); lok {
+				lab = trim_ws(ls)
+			}
+			if len(lab) > 0 {
+				lbl = fmt_label(&label_buf, "%s %s", dev, lab)
+			} else {
+				lbl = fmt_label(&label_buf, "%s Fan %d", dev, i)
+			}
+			si := source_add(app, fd, .Raw_Int, 1, true)
+			metric_add(app, lbl, .RPM, .Other, fan_group, si)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // display helpers
 // ---------------------------------------------------------------------------
@@ -904,10 +1253,17 @@ unit_str :: proc(u: Sensor_Unit) -> string {
 		return "GB"
 	case .Terabytes:
 		return "TB"
+	case .Gibibytes:
+		// RAM is quoted in binary gigabytes; keep the familiar GB label.
+		return "GB"
 	case .Mbps:
 		return "Mb/s"
 	case .DBm:
 		return "dBm"
+	case .Seconds:
+		return "s"
+	case .Milliseconds:
+		return "ms"
 	}
 	return ""
 }
@@ -934,10 +1290,14 @@ unit_decimals :: proc(u: Sensor_Unit) -> int {
 		return 0
 	case .Terabytes:
 		return 1
+	case .Gibibytes:
+		return 2
 	case .Mbps:
 		return 0
 	case .DBm:
 		return 0
+	case .Seconds, .Milliseconds:
+		return 2
 	}
 	return 1
 }
